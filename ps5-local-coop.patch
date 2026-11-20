@@ -1,0 +1,1388 @@
+From f39e098cd9b7a2fcdd6f394c533e2e1edcd66336 Mon Sep 17 00:00:00 2001
+From: brahianrosas26 <brahianrosas26@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 20:48:40 -0300
+Subject: [PATCH] Add PS5 local Remote Play co-op core
+
+---
+ lib/CMakeLists.txt             |   1 +
+ lib/include/chiaki/multislot.h |  36 +++
+ lib/src/ctrl.c                 |  19 +-
+ lib/src/feedbacksender.c       | 355 +---------------------------
+ lib/src/multislot.c            | 417 +++++++++++++++++++++++++++++++++
+ lib/src/streamconnection.c     |  36 ++-
+ lib/src/takion.c               | 152 ++++++++----
+ 7 files changed, 610 insertions(+), 406 deletions(-)
+ create mode 100644 lib/include/chiaki/multislot.h
+ create mode 100644 lib/src/multislot.c
+
+diff --git a/lib/CMakeLists.txt b/lib/CMakeLists.txt
+index ba0a79b..ae6acc0 100644
+--- a/lib/CMakeLists.txt
++++ b/lib/CMakeLists.txt
+@@ -76,6 +76,7 @@ set(SOURCE_FILES
+ 		src/discoveryservice.c
+ 		src/feedback.c
+ 		src/feedbacksender.c
++		src/multislot.c
+ 		src/controller.c
+ 		src/takionsendbuffer.c
+ 		src/time.c
+diff --git a/lib/include/chiaki/multislot.h b/lib/include/chiaki/multislot.h
+new file mode 100644
+index 0000000..f9e38b3
+--- /dev/null
++++ b/lib/include/chiaki/multislot.h
+@@ -0,0 +1,36 @@
++// SPDX-License-Identifier: LicenseRef-AGPL-3.0-only-OpenSSL
++// Local override header — multi-user slot helpers (see docs/EASY_SIGNIN_PLAN.md).
++#ifndef CHIAKI_MULTISLOT_H
++#define CHIAKI_MULTISLOT_H
++
++#include <chiaki/common.h>
++#include <chiaki/session.h>
++#include <chiaki/controller.h>
++#include <chiaki/feedback.h>
++#include <chiaki/takion.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++CHIAKI_EXPORT ChiakiErrorCode chiaki_session_add_user(ChiakiSession *session, uint8_t slot, uint8_t ctrl_type, uint64_t rid);
++CHIAKI_EXPORT ChiakiErrorCode chiaki_session_remove_user(ChiakiSession *session, uint8_t slot);
++CHIAKI_EXPORT void chiaki_multislot_set_controller_state(ChiakiSession *session, uint8_t slot, ChiakiControllerState *state);
++
++// Session-scoped sender lifecycle. No public upstream struct layout changes.
++ChiakiErrorCode chiaki_multislot_sender_init(ChiakiFeedbackSender *sender, ChiakiTakion *takion);
++void chiaki_multislot_sender_fini(ChiakiFeedbackSender *sender);
++ChiakiErrorCode chiaki_multislot_sender_set_state(ChiakiFeedbackSender *sender, uint8_t slot, const ChiakiControllerState *state);
++void chiaki_multislot_ctrl_received(ChiakiSession *session, uint16_t type, const uint8_t *payload, size_t size);
++// 0 idle; 1 joining; 2 joined; 3 leaving; negative values are user-visible failures.
++int chiaki_multislot_status(ChiakiSession *session, uint8_t slot);
++
++// defined in the takion.c override
++ChiakiErrorCode chiaki_takion_send_feedback_state_slot(ChiakiTakion *takion, ChiakiSeqNum16 seq_num, ChiakiFeedbackState *feedback_state, uint8_t slot);
++ChiakiErrorCode chiaki_takion_send_feedback_history_slot(ChiakiTakion *takion, ChiakiSeqNum16 seq_num, uint8_t *payload, size_t payload_size, uint8_t slot);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/lib/src/ctrl.c b/lib/src/ctrl.c
+index 7b1ce49..6bb7f24 100644
+--- a/lib/src/ctrl.c
++++ b/lib/src/ctrl.c
+@@ -5,6 +5,7 @@
+ #include <chiaki/base64.h>
+ #include <chiaki/http.h>
+ #include <chiaki/time.h>
++#include <chiaki/multislot.h>
+ 
+ #include "utils.h"
+ 
+@@ -854,9 +855,21 @@ static void ctrl_message_received(ChiakiCtrl *ctrl, uint16_t msg_type, uint8_t *
+ 		}
+ 	}
+ 
+-	CHIAKI_LOGV(ctrl->session->log, "Ctrl received message of type %#x, size %#llx", (unsigned int)msg_type, (unsigned long long)payload_size);
++	CHIAKI_LOGI(ctrl->session->log, "Ctrl received message of type %#x, size %#llx", (unsigned int)msg_type, (unsigned long long)payload_size);
+ 	if(payload_size > 0)
+-		chiaki_log_hexdump(ctrl->session->log, CHIAKI_LOG_VERBOSE, payload, payload_size);
++		chiaki_log_hexdump(ctrl->session->log, CHIAKI_LOG_INFO, payload, payload_size);
++
++	if(msg_type == 0x8068 || msg_type == 0x8008 || msg_type == 0x8009 ||
++		msg_type == 0x61 || msg_type == 0x64)
++	{
++		// The receive loop owns notif_mutex. Co-op may enqueue a CONTROLLER_DEL,
++		// which takes that mutex again; also never invert it with feedback_sender_mutex.
++		// Only this thread touches recv_buf, so the decrypted payload remains stable.
++		chiaki_mutex_unlock(&ctrl->notif_mutex);
++		chiaki_multislot_ctrl_received(ctrl->session, msg_type, payload, payload_size);
++		chiaki_mutex_lock(&ctrl->notif_mutex);
++		return;
++	}
+ 
+ 	switch(msg_type)
+ 	{
+@@ -892,7 +905,7 @@ static void ctrl_message_received(ChiakiCtrl *ctrl, uint16_t msg_type, uint8_t *
+ 			ctrl_message_received_switch_to_stream_connection(ctrl, payload, payload_size);
+ 			break;
+ 		default:
+-			// CHIAKI_LOGW(ctrl->session->log, "Received Ctrl Message with unknown type %#x", msg_type);
++			CHIAKI_LOGI(ctrl->session->log, "Received Ctrl Message with unknown type %#x", msg_type);
+ 			chiaki_log_hexdump(ctrl->session->log, CHIAKI_LOG_WARNING, payload, payload_size);
+ 			break;
+ 	}
+diff --git a/lib/src/feedbacksender.c b/lib/src/feedbacksender.c
+index 817544a..496a6d9 100644
+--- a/lib/src/feedbacksender.c
++++ b/lib/src/feedbacksender.c
+@@ -1,355 +1,16 @@
+ // SPDX-License-Identifier: LicenseRef-AGPL-3.0-only-OpenSSL
++// Preserve upstream ABI; one session-owned sender multiplexes all controller slots.
++#include <chiaki/multislot.h>
+ 
+-#include <chiaki/feedbacksender.h>
+-#include <chiaki/time.h>
+-
+-#include <string.h>
+-
+-#define FEEDBACK_STATE_TIMEOUT_MIN_MS 8 // minimum time to wait between sending 2 packets
+-#define FEEDBACK_STATE_TIMEOUT_MAX_MS 200 // maximum time to wait between sending 2 packets
+-
+-#define FEEDBACK_HISTORY_BUFFER_SIZE 0x10
+-// Number of most recent events repeated in every history packet.
+-// Analog L2/R2 produce one event per value change, so with only 4 a button release
+-// (e.g. L1/R1) could drop out of the window within one or two packets.
+-#define FEEDBACK_HISTORY_RESEND_EVENT_COUNT 0x8
+-
+-// Every history event takes the next sequence number and a packet carries the number of its
+-// newest event. The console keeps the last number it applied and takes only as many of a
+-// packet's events as the number moved, so it applies each event once and a repeat of a packet
+-// it already has changes nothing.
+-//
+-// History packets are sent once over UDP without acknowledgement. If the packet carrying
+-// the last change (typically a button release) is lost and nothing else changes afterwards,
+-// the console never sees it and the button stays held. So after the newest history packet,
+-// if nothing new is queued, the same packet is sent again with the same sequence number at
+-// these offsets (ms after it was sent).
+-static const uint64_t feedback_history_tail_ms[] = { 20, 50, 100, 200 };
+-#define FEEDBACK_HISTORY_TAIL_COUNT (sizeof(feedback_history_tail_ms) / sizeof(feedback_history_tail_ms[0]))
+-
+-static void *feedback_sender_thread_func(void *user);
+-static void feedback_sender_send_state(ChiakiFeedbackSender *feedback_sender, const ChiakiControllerState *state);
+-static void feedback_sender_send_history_packet(ChiakiFeedbackSender *feedback_sender, ChiakiSeqNum16 seq_num, uint8_t event_count, const uint8_t *buf, size_t buf_size);
+-static void feedback_sender_flush_history_locked(ChiakiFeedbackSender *feedback_sender);
+-static void feedback_sender_record_history(ChiakiFeedbackSender *feedback_sender, const ChiakiControllerState *state_prev, const ChiakiControllerState *state_now);
+-
+-CHIAKI_EXPORT ChiakiErrorCode chiaki_feedback_sender_init(ChiakiFeedbackSender *feedback_sender, ChiakiTakion *takion)
+-{
+-	feedback_sender->log = takion->log;
+-	feedback_sender->takion = takion;
+-
+-	chiaki_controller_state_set_idle(&feedback_sender->controller_state_prev);
+-	chiaki_controller_state_set_idle(&feedback_sender->controller_state_history_prev);
+-	chiaki_controller_state_set_idle(&feedback_sender->controller_state);
+-
+-	feedback_sender->state_seq_num = 0;
+-
+-	feedback_sender->history_seq_num = 0;
+-	feedback_sender->history_packet_begin = 0;
+-	feedback_sender->history_packet_len = 0;
+-	feedback_sender->should_stop = false;
+-	feedback_sender->controller_state_changed = false;
+-	feedback_sender->history_dirty = false;
+-	feedback_sender->history_last_size = 0;
+-	feedback_sender->history_last_event_count = 0;
+-	feedback_sender->history_last_seq_num = 0;
+-	feedback_sender->history_last_sent_ms = 0;
+-	feedback_sender->history_tail_resends = FEEDBACK_HISTORY_TAIL_COUNT;
+-	ChiakiErrorCode err = chiaki_feedback_history_buffer_init(&feedback_sender->history_buf, FEEDBACK_HISTORY_BUFFER_SIZE);
+-	if(err != CHIAKI_ERR_SUCCESS)
+-		return err;
+-
+-	err = chiaki_mutex_init(&feedback_sender->state_mutex, false);
+-	if(err != CHIAKI_ERR_SUCCESS)
+-		goto error_history_buffer;
+-
+-	err = chiaki_cond_init(&feedback_sender->state_cond);
+-	if(err != CHIAKI_ERR_SUCCESS)
+-		goto error_mutex;
+-
+-	err = chiaki_thread_create(&feedback_sender->thread, feedback_sender_thread_func, feedback_sender);
+-	if(err != CHIAKI_ERR_SUCCESS)
+-		goto error_cond;
+-
+-	chiaki_thread_set_name(&feedback_sender->thread, "Chiaki Feedback Sender");
+-
+-	return CHIAKI_ERR_SUCCESS;
+-error_cond:
+-	chiaki_cond_fini(&feedback_sender->state_cond);
+-error_mutex:
+-	chiaki_mutex_fini(&feedback_sender->state_mutex);
+-error_history_buffer:
+-	chiaki_feedback_history_buffer_fini(&feedback_sender->history_buf);
+-	return err;
+-}
+-
+-CHIAKI_EXPORT void chiaki_feedback_sender_fini(ChiakiFeedbackSender *feedback_sender)
+-{
+-	chiaki_mutex_lock(&feedback_sender->state_mutex);
+-	feedback_sender->should_stop = true;
+-	chiaki_mutex_unlock(&feedback_sender->state_mutex);
+-	chiaki_cond_signal(&feedback_sender->state_cond);
+-	chiaki_thread_join(&feedback_sender->thread, NULL);
+-	chiaki_cond_fini(&feedback_sender->state_cond);
+-	chiaki_mutex_fini(&feedback_sender->state_mutex);
+-	chiaki_feedback_history_buffer_fini(&feedback_sender->history_buf);
+-}
+-
+-CHIAKI_EXPORT ChiakiErrorCode chiaki_feedback_sender_set_controller_state(ChiakiFeedbackSender *feedback_sender, ChiakiControllerState *state)
+-{
+-	ChiakiErrorCode err = chiaki_mutex_lock(&feedback_sender->state_mutex);
+-	if(err != CHIAKI_ERR_SUCCESS)
+-		return err;
+-
+-	if(chiaki_controller_state_equals(&feedback_sender->controller_state, state))
+-	{
+-		chiaki_mutex_unlock(&feedback_sender->state_mutex);
+-		return CHIAKI_ERR_SUCCESS;
+-	}
+-
+-	feedback_sender->controller_state = *state;
+-	feedback_sender_record_history(feedback_sender, &feedback_sender->controller_state_history_prev, &feedback_sender->controller_state);
+-	feedback_sender->controller_state_history_prev = feedback_sender->controller_state;
+-	feedback_sender->controller_state_changed = true;
+-
+-	chiaki_mutex_unlock(&feedback_sender->state_mutex);
+-	chiaki_cond_signal(&feedback_sender->state_cond);
+-
+-	return CHIAKI_ERR_SUCCESS;
+-}
+-
+-static bool controller_state_equals_for_feedback_state(ChiakiControllerState *a, ChiakiControllerState *b)
+-{
+-	if(!(a->left_x == b->left_x
+-		&& a->left_y == b->left_y
+-		&& a->right_x == b->right_x
+-		&& a->right_y == b->right_y))
+-		return false;
+-#define CHECKF(n) if(a->n < b->n - 0.0000001f || a->n > b->n + 0.0000001f) return false
+-	CHECKF(gyro_x);
+-	CHECKF(gyro_y);
+-	CHECKF(gyro_z);
+-	CHECKF(accel_x);
+-	CHECKF(accel_y);
+-	CHECKF(accel_z);
+-	CHECKF(orient_x);
+-	CHECKF(orient_y);
+-	CHECKF(orient_z);
+-	CHECKF(orient_w);
+-#undef CHECKF
+-	return true;
+-}
+-
+-static void feedback_sender_send_state(ChiakiFeedbackSender *feedback_sender, const ChiakiControllerState *state)
+-{
+-	ChiakiFeedbackState feedback_state;
+-	feedback_state.left_x = state->left_x;
+-	feedback_state.left_y = state->left_y;
+-	feedback_state.right_x = state->right_x;
+-	feedback_state.right_y = state->right_y;
+-	feedback_state.gyro_x = state->gyro_x;
+-	feedback_state.gyro_y = state->gyro_y;
+-	feedback_state.gyro_z = state->gyro_z;
+-	feedback_state.accel_x = state->accel_x;
+-	feedback_state.accel_y = state->accel_y;
+-	feedback_state.accel_z = state->accel_z;
+-
+-	feedback_state.orient_x = state->orient_x;
+-	feedback_state.orient_y = state->orient_y;
+-	feedback_state.orient_z = state->orient_z;
+-	feedback_state.orient_w = state->orient_w;
+-
+-	ChiakiErrorCode err = chiaki_takion_send_feedback_state(feedback_sender->takion, feedback_sender->state_seq_num++, &feedback_state);
+-	if(err != CHIAKI_ERR_SUCCESS)
+-		CHIAKI_LOGE(feedback_sender->log, "FeedbackSender failed to send Feedback State");
+-}
+-
+-static void feedback_sender_send_history_packet(ChiakiFeedbackSender *feedback_sender, ChiakiSeqNum16 seq_num, uint8_t event_count, const uint8_t *buf, size_t buf_size)
+-{
+-	//CHIAKI_LOGD(feedback_sender->log, "Feedback History:");
+-	//chiaki_log_hexdump(feedback_sender->log, CHIAKI_LOG_DEBUG, buf, buf_size);
+-	chiaki_takion_send_feedback_history(feedback_sender->takion, seq_num, event_count, (uint8_t *)buf, buf_size);
+-}
+-
+-static void feedback_sender_flush_history_locked(ChiakiFeedbackSender *feedback_sender)
+-{
+-	if(!feedback_sender->history_dirty)
+-		return;
+-
+-	size_t packet_index = (feedback_sender->history_packet_begin + feedback_sender->history_packet_len)
+-		% CHIAKI_FEEDBACK_HISTORY_PACKET_QUEUE_SIZE;
+-	size_t packet_size = CHIAKI_FEEDBACK_HISTORY_PACKET_BUF_SIZE;
+-	ChiakiErrorCode err = chiaki_feedback_history_buffer_format(
+-			&feedback_sender->history_buf,
+-			feedback_sender->history_packets[packet_index],
+-			&packet_size);
+-	if(err != CHIAKI_ERR_SUCCESS)
+-	{
+-		CHIAKI_LOGE(feedback_sender->log, "Feedback Sender failed to format history buffer");
+-		return;
+-	}
+-	uint8_t event_count = (uint8_t)feedback_sender->history_buf.len;
+-	// the newest event in the packet took the number before the next one
+-	ChiakiSeqNum16 seq_num = (ChiakiSeqNum16)(feedback_sender->history_seq_num - 1);
+-
+-	if(feedback_sender->history_packet_len < CHIAKI_FEEDBACK_HISTORY_PACKET_QUEUE_SIZE)
+-	{
+-		feedback_sender->history_packet_sizes[packet_index] = packet_size;
+-		feedback_sender->history_packet_event_counts[packet_index] = event_count;
+-		feedback_sender->history_packet_seq_nums[packet_index] = seq_num;
+-		feedback_sender->history_packet_len++;
+-	}
+-	else
+-	{
+-		// dropping the oldest queued packet keeps the numbering: the next packet's number still
+-		// moves by every event since the last packet sent
+-		feedback_sender->history_packet_sizes[feedback_sender->history_packet_begin] = packet_size;
+-		feedback_sender->history_packet_event_counts[feedback_sender->history_packet_begin] = event_count;
+-		feedback_sender->history_packet_seq_nums[feedback_sender->history_packet_begin] = seq_num;
+-		memcpy(
+-			feedback_sender->history_packets[feedback_sender->history_packet_begin],
+-			feedback_sender->history_packets[packet_index],
+-			packet_size);
+-		feedback_sender->history_packet_begin = (feedback_sender->history_packet_begin + 1)
+-			% CHIAKI_FEEDBACK_HISTORY_PACKET_QUEUE_SIZE;
+-		CHIAKI_LOGW(feedback_sender->log, "Feedback Sender history packet queue overflow");
+-	}
+-
+-	if(feedback_sender->history_buf.len > FEEDBACK_HISTORY_RESEND_EVENT_COUNT)
+-		feedback_sender->history_buf.len = FEEDBACK_HISTORY_RESEND_EVENT_COUNT;
+-	feedback_sender->history_dirty = false;
+-}
+-
+-static void feedback_sender_history_event_pushed(void *user)
++CHIAKI_EXPORT ChiakiErrorCode chiaki_feedback_sender_init(ChiakiFeedbackSender *sender, ChiakiTakion *takion)
+ {
+-	ChiakiFeedbackSender *feedback_sender = user;
+-	feedback_sender->history_seq_num++;
+-	feedback_sender->history_dirty = true;
+-	feedback_sender_flush_history_locked(feedback_sender);
++    return chiaki_multislot_sender_init(sender, takion);
+ }
+-
+-static void feedback_sender_record_history(ChiakiFeedbackSender *feedback_sender, const ChiakiControllerState *state_prev, const ChiakiControllerState *state_now)
++CHIAKI_EXPORT void chiaki_feedback_sender_fini(ChiakiFeedbackSender *sender)
+ {
+-	chiaki_feedback_history_buffer_record_state(&feedback_sender->history_buf, feedback_sender->log, state_prev, state_now,
+-			feedback_sender_history_event_pushed, feedback_sender);
++    chiaki_multislot_sender_fini(sender);
+ }
+-
+-static bool state_cond_check(void *user)
++CHIAKI_EXPORT ChiakiErrorCode chiaki_feedback_sender_set_controller_state(ChiakiFeedbackSender *sender, ChiakiControllerState *state)
+ {
+-	ChiakiFeedbackSender *feedback_sender = user;
+-	return feedback_sender->should_stop
+-		|| feedback_sender->controller_state_changed;
+-}
+-
+-static void *feedback_sender_thread_func(void *user)
+-{
+-	ChiakiFeedbackSender *feedback_sender = user;
+-	chiaki_thread_set_affinity(CHIAKI_THREAD_NAME_FEEDBACK);
+-
+-	ChiakiErrorCode err = chiaki_mutex_lock(&feedback_sender->state_mutex);
+-	if(err != CHIAKI_ERR_SUCCESS)
+-		return NULL;
+-
+-	uint64_t last_feedback_state_ms = chiaki_time_now_monotonic_ms();
+-	while(true)
+-	{
+-		if(feedback_sender->history_packet_len == 0)
+-		{
+-			uint64_t now_ms = chiaki_time_now_monotonic_ms();
+-			uint64_t next_timeout = FEEDBACK_STATE_TIMEOUT_MAX_MS;
+-			if(now_ms - last_feedback_state_ms < FEEDBACK_STATE_TIMEOUT_MAX_MS)
+-				next_timeout = FEEDBACK_STATE_TIMEOUT_MAX_MS - (now_ms - last_feedback_state_ms);
+-			// wake up in time for the next tail resend of the last history packet
+-			if(feedback_sender->history_tail_resends < FEEDBACK_HISTORY_TAIL_COUNT)
+-			{
+-				uint64_t due_ms = feedback_sender->history_last_sent_ms + feedback_history_tail_ms[feedback_sender->history_tail_resends];
+-				uint64_t until_due = due_ms > now_ms ? due_ms - now_ms : 0;
+-				if(until_due < next_timeout)
+-					next_timeout = until_due;
+-			}
+-
+-			err = chiaki_cond_timedwait_pred(&feedback_sender->state_cond, &feedback_sender->state_mutex, next_timeout, state_cond_check, feedback_sender);
+-			if(err != CHIAKI_ERR_SUCCESS && err != CHIAKI_ERR_TIMEOUT)
+-				break;
+-		}
+-		else
+-		{
+-			err = CHIAKI_ERR_SUCCESS;
+-		}
+-
+-		if(feedback_sender->should_stop)
+-			break;
+-
+-		uint64_t now_ms = chiaki_time_now_monotonic_ms();
+-		bool send_feedback_state = now_ms - last_feedback_state_ms >= FEEDBACK_STATE_TIMEOUT_MAX_MS;
+-		ChiakiControllerState state_now = feedback_sender->controller_state;
+-		bool send_feedback_history = false;
+-		uint8_t history_buf[CHIAKI_FEEDBACK_HISTORY_PACKET_BUF_SIZE];
+-		size_t history_buf_size = 0;
+-		uint8_t history_event_count = 0;
+-		ChiakiSeqNum16 history_packet_seq_num = 0;
+-
+-		if(feedback_sender->controller_state_changed)
+-		{
+-			// TODO: FEEDBACK_STATE_TIMEOUT_MIN_MS
+-			feedback_sender->controller_state_changed = false;
+-			send_feedback_state = true;
+-
+-			// don't need to send feedback state if nothing relevant changed
+-			if(controller_state_equals_for_feedback_state(&state_now, &feedback_sender->controller_state_prev))
+-				send_feedback_state = false;
+-		} // else: timeout
+-
+-		if(feedback_sender->history_packet_len > 0)
+-		{
+-			size_t packet_index = feedback_sender->history_packet_begin;
+-			history_buf_size = feedback_sender->history_packet_sizes[packet_index];
+-			history_event_count = feedback_sender->history_packet_event_counts[packet_index];
+-			history_packet_seq_num = feedback_sender->history_packet_seq_nums[packet_index];
+-			memcpy(history_buf, feedback_sender->history_packets[packet_index], history_buf_size);
+-			feedback_sender->history_packet_begin = (feedback_sender->history_packet_begin + 1)
+-				% CHIAKI_FEEDBACK_HISTORY_PACKET_QUEUE_SIZE;
+-			feedback_sender->history_packet_len--;
+-			send_feedback_history = true;
+-			// remember it for tail resends; a new packet restarts the schedule
+-			memcpy(feedback_sender->history_last_packet, history_buf, history_buf_size);
+-			feedback_sender->history_last_size = history_buf_size;
+-			feedback_sender->history_last_event_count = history_event_count;
+-			feedback_sender->history_last_seq_num = history_packet_seq_num;
+-			feedback_sender->history_last_sent_ms = now_ms;
+-			feedback_sender->history_tail_resends = 0;
+-		}
+-		else if(feedback_sender->history_last_size > 0
+-			&& feedback_sender->history_tail_resends < FEEDBACK_HISTORY_TAIL_COUNT
+-			&& now_ms >= feedback_sender->history_last_sent_ms + feedback_history_tail_ms[feedback_sender->history_tail_resends])
+-		{
+-			// nothing new since the last history packet: send it again with the same sequence number
+-			history_buf_size = feedback_sender->history_last_size;
+-			history_event_count = feedback_sender->history_last_event_count;
+-			history_packet_seq_num = feedback_sender->history_last_seq_num;
+-			memcpy(history_buf, feedback_sender->history_last_packet, history_buf_size);
+-			feedback_sender->history_tail_resends++;
+-			send_feedback_history = true;
+-		}
+-		chiaki_mutex_unlock(&feedback_sender->state_mutex);
+-
+-		if(send_feedback_state)
+-			feedback_sender_send_state(feedback_sender, &state_now);
+-
+-		if(send_feedback_history)
+-			feedback_sender_send_history_packet(feedback_sender, history_packet_seq_num, history_event_count, history_buf, history_buf_size);
+-
+-		err = chiaki_mutex_lock(&feedback_sender->state_mutex);
+-		if(err != CHIAKI_ERR_SUCCESS)
+-			return NULL;
+-		if(send_feedback_state)
+-		{
+-			feedback_sender->controller_state_prev = state_now;
+-			last_feedback_state_ms = chiaki_time_now_monotonic_ms();
+-		}
+-	}
+-
+-	chiaki_mutex_unlock(&feedback_sender->state_mutex);
+-
+-	return NULL;
++    return chiaki_multislot_sender_set_state(sender, 0, state);
+ }
+diff --git a/lib/src/multislot.c b/lib/src/multislot.c
+new file mode 100644
+index 0000000..3d97d57
+--- /dev/null
++++ b/lib/src/multislot.c
+@@ -0,0 +1,417 @@
++// SPDX-License-Identifier: LicenseRef-AGPL-3.0-only-OpenSSL
++// Local Remote Play co-op implementation. Packet offsets verified against Asobi.
++#include <chiaki/multislot.h>
++#include <chiaki/ctrl.h>
++#include <chiaki/time.h>
++#include <takion.pb.h>
++#include <pb_encode.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define SLOT_COUNT 7
++#define HISTORY_COUNT 40
++#define HISTORY_RETAIN 20
++#define FEEDBACK_MS 200
++#ifndef CHIAKI_COOP_JOIN_TIMEOUT_MS
++#define CHIAKI_COOP_JOIN_TIMEOUT_MS 30000
++#endif
++
++typedef struct {
++    ChiakiControllerState state;
++    bool active, dirty, reserved, cancelled;
++    int status, failure;
++    uint64_t rid, last_state_ms;
++} Slot;
++
++typedef struct Sender {
++    struct Sender *next;
++    ChiakiFeedbackSender *owner;
++    ChiakiTakion *takion;
++    ChiakiMutex mutex;
++    ChiakiCond cond;
++    ChiakiThread thread;
++    bool stopping;
++    Slot slots[SLOT_COUNT];
++    ChiakiFeedbackHistoryBuffer history;
++    uint8_t packets[CHIAKI_FEEDBACK_HISTORY_PACKET_QUEUE_SIZE][CHIAKI_FEEDBACK_HISTORY_PACKET_BUF_SIZE];
++    size_t packet_sizes[CHIAKI_FEEDBACK_HISTORY_PACKET_QUEUE_SIZE], begin, count;
++    ChiakiSeqNum16 state_seq, history_seq;
++    uint64_t history_revision;
++    uint8_t last_history[CHIAKI_FEEDBACK_HISTORY_PACKET_BUF_SIZE];
++    size_t last_history_size;
++    uint64_t last_history_ms, join_deadline;
++    uint8_t pending_slot;
++} Sender;
++
++// Registry is only an ABI-preserving lookup. State, counters and lifetime belong to a session.
++static ChiakiMutex registry_mutex;
++static bool registry_mutex_initialized;
++static Sender *senders;
++
++static void registry_lock(void)
++{
++    /* Sender creation happens on the UI/session thread before sender threads run. */
++    if(!registry_mutex_initialized)
++    {
++        chiaki_mutex_init(&registry_mutex, false);
++        registry_mutex_initialized = true;
++    }
++    chiaki_mutex_lock(&registry_mutex);
++}
++
++static Sender *lock_sender(ChiakiFeedbackSender *owner)
++{
++    registry_lock();
++    Sender *s = senders;
++    while(s && s->owner != owner) s = s->next;
++    if(s) chiaki_mutex_lock(&s->mutex);
++    chiaki_mutex_unlock(&registry_mutex);
++    return s;
++}
++
++static Sender *lock_session(ChiakiSession *session)
++{
++    chiaki_mutex_lock(&session->stream_connection.feedback_sender_mutex);
++    Sender *s = session->stream_connection.feedback_sender_active
++        ? lock_sender(&session->stream_connection.feedback_sender) : NULL;
++    if(!s) chiaki_mutex_unlock(&session->stream_connection.feedback_sender_mutex);
++    return s;
++}
++static void unlock_session(ChiakiSession *session, Sender *s)
++{
++    chiaki_mutex_unlock(&s->mutex);
++    chiaki_mutex_unlock(&session->stream_connection.feedback_sender_mutex);
++}
++
++static ChiakiErrorCode controller_connection(ChiakiSession *session, uint8_t slot, bool connected)
++{
++    tkproto_TakionMessage msg = {0};
++    msg.type = tkproto_TakionMessage_PayloadType_CONTROLLERCONNECTION;
++    msg.has_controller_connection_payload = true;
++    msg.controller_connection_payload.has_connected = true;
++    msg.controller_connection_payload.connected = connected;
++    msg.controller_connection_payload.has_controller_id = true;
++    msg.controller_connection_payload.controller_id = slot;
++    msg.controller_connection_payload.has_controller_type = true;
++    msg.controller_connection_payload.controller_type = session->connect_info.enable_dualsense
++        ? tkproto_ControllerConnectionPayload_ControllerType_DUALSENSE
++        : tkproto_ControllerConnectionPayload_ControllerType_DUALSHOCK4;
++    uint8_t buf[128];
++    pb_ostream_t stream = pb_ostream_from_buffer(buf, sizeof(buf));
++    if(!pb_encode(&stream, tkproto_TakionMessage_fields, &msg)) return CHIAKI_ERR_UNKNOWN;
++    return chiaki_takion_send_message_data(&session->stream_connection.takion, 1, 1, buf, stream.bytes_written, NULL);
++}
++
++static void queue_history(Sender *s)
++{
++    if(!s->history.len) return;
++    size_t index = (s->begin + s->count) % CHIAKI_FEEDBACK_HISTORY_PACKET_QUEUE_SIZE;
++    size_t size = sizeof(s->packets[index]);
++    if(chiaki_feedback_history_buffer_format(&s->history, s->packets[index], &size) != CHIAKI_ERR_SUCCESS) return;
++    s->packet_sizes[index] = size;
++    if(s->count == CHIAKI_FEEDBACK_HISTORY_PACKET_QUEUE_SIZE)
++        s->begin = (s->begin + 1) % CHIAKI_FEEDBACK_HISTORY_PACKET_QUEUE_SIZE;
++    else s->count++;
++    if(s->history.len > HISTORY_RETAIN) s->history.len = HISTORY_RETAIN;
++}
++
++static void push_event(Sender *s, ChiakiFeedbackHistoryEvent *event)
++{
++    chiaki_feedback_history_buffer_push(&s->history, event);
++    s->history_revision++;
++}
++
++static void record_button(Sender *s, uint8_t slot, uint64_t button, uint8_t value)
++{
++    ChiakiFeedbackHistoryEvent event;
++    if(chiaki_feedback_history_event_set_button(&event, button, value) != CHIAKI_ERR_SUCCESS) return;
++    event.buf[0] = 0x80 | slot;
++    push_event(s, &event);
++}
++
++static void record_state(Sender *s, uint8_t slot, const ChiakiControllerState *old, const ChiakiControllerState *now)
++{
++    uint64_t revision = s->history_revision;
++    for(size_t i = 0; i < CHIAKI_CONTROLLER_TOUCHES_MAX; i++) {
++        const ChiakiControllerTouch *a = &old->touches[i], *b = &now->touches[i];
++        // A changed pointer ID needs both a release and a new contact.
++        if(a->id >= 0 && a->id != b->id) {
++            ChiakiFeedbackHistoryEvent e;
++            chiaki_feedback_history_event_set_touchpad(&e, false, a->id, a->x, a->y);
++            e.buf[0] |= slot;
++            push_event(s, &e);
++        }
++        if(b->id >= 0 && (a->id != b->id || a->x != b->x || a->y != b->y)) {
++            ChiakiFeedbackHistoryEvent e;
++            chiaki_feedback_history_event_set_touchpad(&e, true, b->id, b->x, b->y);
++            e.buf[0] |= slot;
++            push_event(s, &e);
++        }
++    }
++    for(unsigned i = 0; i < CHIAKI_CONTROLLER_BUTTONS_COUNT; i++) {
++        uint64_t bit = UINT64_C(1) << i;
++        if((old->buttons ^ now->buttons) & bit) record_button(s, slot, bit, now->buttons & bit ? 0xff : 0);
++    }
++    if(old->l2_state != now->l2_state) record_button(s, slot, CHIAKI_CONTROLLER_ANALOG_BUTTON_L2, now->l2_state);
++    if(old->r2_state != now->r2_state) record_button(s, slot, CHIAKI_CONTROLLER_ANALOG_BUTTON_R2, now->r2_state);
++    if(s->history_revision != revision) queue_history(s);
++}
++
++static void discard_slot_history(Sender *s, uint8_t slot)
++{
++    ChiakiFeedbackHistoryEvent events[HISTORY_COUNT];
++    size_t count = 0;
++    for(size_t i = 0; i < s->history.len; i++) {
++        ChiakiFeedbackHistoryEvent e = s->history.events[(s->history.begin + i) % s->history.size];
++        if((e.buf[0] & 0xf) != slot) events[count++] = e;
++    }
++    s->history.len = 0;
++    while(count) chiaki_feedback_history_buffer_push(&s->history, &events[--count]);
++    s->begin = s->count = 0;
++    s->last_history_size = 0;
++    // Re-queue surviving events once so another player's pending release is not lost.
++    queue_history(s);
++}
++
++static bool pending(void *user)
++{
++    Sender *s = user;
++    if(s->stopping || s->count) return true;
++    for(unsigned i = 0; i < SLOT_COUNT; i++)
++        if(s->slots[i].active && s->slots[i].dirty) return true;
++    return false;
++}
++
++static void *sender_thread(void *user)
++{
++    Sender *s = user;
++    chiaki_mutex_lock(&s->mutex);
++    while(!s->stopping) {
++        if(!pending(s)) chiaki_cond_timedwait_pred(&s->cond, &s->mutex, FEEDBACK_MS, pending, s);
++        if(s->stopping) break;
++        uint64_t now = chiaki_time_now_monotonic_ms();
++        if(s->pending_slot && now >= s->join_deadline) {
++            Slot *slot = &s->slots[s->pending_slot];
++            if(!slot->cancelled) { slot->cancelled = true; slot->status = slot->failure = -6; }
++            // Keep the slot reserved until its host reply; a delayed success must be removed.
++        }
++        for(uint8_t i = 0; i < SLOT_COUNT; i++) {
++            Slot *slot = &s->slots[i];
++            if(!slot->active || (!slot->dirty && now - slot->last_state_ms < FEEDBACK_MS)) continue;
++            ChiakiControllerState *state = &slot->state;
++            ChiakiFeedbackState fs = {
++                .left_x = state->left_x, .left_y = state->left_y,
++                .right_x = state->right_x, .right_y = state->right_y,
++                .gyro_x = state->gyro_x, .gyro_y = state->gyro_y, .gyro_z = state->gyro_z,
++                .accel_x = state->accel_x, .accel_y = state->accel_y, .accel_z = state->accel_z,
++                .orient_x = state->orient_x, .orient_y = state->orient_y,
++                .orient_z = state->orient_z, .orient_w = state->orient_w
++            };
++            chiaki_takion_send_feedback_state_slot(s->takion, s->state_seq++, &fs, i);
++            slot->dirty = false;
++            slot->last_state_ms = now;
++        }
++        // Repeat recent releases while idle as well: UDP loss must not leave a held button.
++        if(!s->count && s->last_history_size && now - s->last_history_ms >= FEEDBACK_MS) {
++            // A retransmission keeps its sequence: old presses must not look like new events.
++            chiaki_takion_send_feedback_history_slot(s->takion, (ChiakiSeqNum16)(s->history_seq - 1), s->last_history, s->last_history_size, 0);
++            s->last_history_ms = now;
++        }
++        if(s->count) {
++            size_t index = s->begin;
++            chiaki_takion_send_feedback_history_slot(s->takion, s->history_seq++, s->packets[index], s->packet_sizes[index], 0);
++            memcpy(s->last_history, s->packets[index], s->packet_sizes[index]);
++            s->last_history_size = s->packet_sizes[index];
++            s->begin = (s->begin + 1) % CHIAKI_FEEDBACK_HISTORY_PACKET_QUEUE_SIZE;
++            s->count--;
++            s->last_history_ms = now;
++        }
++    }
++    chiaki_mutex_unlock(&s->mutex);
++    return NULL;
++}
++
++ChiakiErrorCode chiaki_multislot_sender_init(ChiakiFeedbackSender *owner, ChiakiTakion *takion)
++{
++    Sender *s = calloc(1, sizeof(*s));
++    if(!s) return CHIAKI_ERR_MEMORY;
++    s->owner = owner; s->takion = takion;
++    for(unsigned i = 0; i < SLOT_COUNT; i++) chiaki_controller_state_set_idle(&s->slots[i].state);
++    s->slots[0].active = s->slots[0].dirty = true;
++    ChiakiErrorCode err = chiaki_feedback_history_buffer_init(&s->history, HISTORY_COUNT);
++    if(err != CHIAKI_ERR_SUCCESS) goto free_sender;
++    err = chiaki_mutex_init(&s->mutex, false);
++    if(err != CHIAKI_ERR_SUCCESS) goto free_history;
++    err = chiaki_cond_init(&s->cond);
++    if(err != CHIAKI_ERR_SUCCESS) goto free_mutex;
++    err = chiaki_thread_create(&s->thread, sender_thread, s);
++    if(err != CHIAKI_ERR_SUCCESS) goto free_cond;
++    registry_lock();
++    s->next = senders; senders = s;
++    chiaki_mutex_unlock(&registry_mutex);
++    chiaki_thread_set_name(&s->thread, "Chiaki Slot Feedback");
++    return CHIAKI_ERR_SUCCESS;
++free_cond: chiaki_cond_fini(&s->cond);
++free_mutex: chiaki_mutex_fini(&s->mutex);
++free_history: chiaki_feedback_history_buffer_fini(&s->history);
++free_sender: free(s); return err;
++}
++
++void chiaki_multislot_sender_fini(ChiakiFeedbackSender *owner)
++{
++    registry_lock();
++    Sender **link = &senders;
++    while(*link && (*link)->owner != owner) link = &(*link)->next;
++    Sender *s = *link;
++    if(s) { *link = s->next; chiaki_mutex_lock(&s->mutex); }
++    chiaki_mutex_unlock(&registry_mutex);
++    if(!s) return;
++    s->stopping = true;
++    chiaki_cond_signal(&s->cond);
++    chiaki_mutex_unlock(&s->mutex);
++    chiaki_thread_join(&s->thread, NULL);
++    chiaki_cond_fini(&s->cond); chiaki_mutex_fini(&s->mutex);
++    chiaki_feedback_history_buffer_fini(&s->history);
++    free(s);
++}
++
++ChiakiErrorCode chiaki_multislot_sender_set_state(ChiakiFeedbackSender *owner, uint8_t slot, const ChiakiControllerState *state)
++{
++    if(slot >= SLOT_COUNT) return CHIAKI_ERR_INVALID_DATA;
++    Sender *s = lock_sender(owner);
++    if(!s) return CHIAKI_ERR_UNINITIALIZED;
++    Slot *pad = &s->slots[slot];
++    if(pad->active && !chiaki_controller_state_equals(&pad->state, (ChiakiControllerState *)state)) {
++        record_state(s, slot, &pad->state, state);
++        pad->state = *state; pad->dirty = true;
++        chiaki_cond_signal(&s->cond);
++    }
++    chiaki_mutex_unlock(&s->mutex);
++    return CHIAKI_ERR_SUCCESS;
++}
++
++void chiaki_multislot_set_controller_state(ChiakiSession *session, uint8_t slot, ChiakiControllerState *state)
++{
++    if(slot < 1 || slot >= SLOT_COUNT) return;
++    chiaki_mutex_lock(&session->stream_connection.feedback_sender_mutex);
++    if(session->stream_connection.feedback_sender_active)
++        chiaki_multislot_sender_set_state(&session->stream_connection.feedback_sender, slot, state);
++    chiaki_mutex_unlock(&session->stream_connection.feedback_sender_mutex);
++}
++
++ChiakiErrorCode chiaki_session_add_user(ChiakiSession *session, uint8_t slot, uint8_t ctrl_type, uint64_t rid)
++{
++    if(slot < 1 || slot >= SLOT_COUNT || !rid || !chiaki_target_is_ps5(session->target)) return CHIAKI_ERR_INVALID_DATA;
++    Sender *s = lock_session(session);
++    if(!s) return CHIAKI_ERR_UNINITIALIZED;
++    Slot *pad = &s->slots[slot];
++    ChiakiErrorCode err = CHIAKI_ERR_MUTEX_LOCKED;
++    if(s->pending_slot || pad->reserved) goto done;
++    for(unsigned i = 1; i < SLOT_COUNT; i++) if(s->slots[i].reserved && s->slots[i].rid == rid) goto done;
++    uint8_t payload[16] = {0};
++    for(unsigned i = 0; i < 8; i++) payload[i] = (uint8_t)(rid >> (8 * i));
++    payload[8] = slot;
++    // CTRLADD_EX uses the control-channel type (3), not the Takion
++    // CONTROLLERCONNECTION enum (DS4=8 / DualSense=12).
++    payload[9] = ctrl_type ? ctrl_type : 3;
++    pad->reserved = true; pad->cancelled = false; pad->rid = rid; pad->status = 1; pad->failure = 0;
++    s->pending_slot = slot; s->join_deadline = chiaki_time_now_monotonic_ms() + CHIAKI_COOP_JOIN_TIMEOUT_MS;
++    CHIAKI_LOGI(session->log, "Co-op requesting join: local_player=%u protocol_slot=%u control_type=%u", slot + 1, slot, payload[9]);
++    err = chiaki_ctrl_send_message(&session->ctrl, 0x68, payload, sizeof(payload));
++    if(err != CHIAKI_ERR_SUCCESS) { pad->reserved = false; pad->status = pad->failure = -5; s->pending_slot = 0; }
++done:
++    unlock_session(session, s);
++    return err;
++}
++
++static ChiakiErrorCode leave_locked(ChiakiSession *session, Sender *s, uint8_t slot)
++{
++    Slot *pad = &s->slots[slot];
++    ChiakiControllerState idle;
++    chiaki_controller_state_set_idle(&idle);
++    if(pad->active) record_state(s, slot, &pad->state, &idle);
++    pad->state = idle;
++    pad->active = false; pad->status = 3;
++    // Keep neutral/release history retryable until the host acknowledges removal.
++    chiaki_cond_signal(&s->cond);
++    ChiakiErrorCode err = chiaki_ctrl_send_message(&session->ctrl, 0x09, &slot, 1);
++    controller_connection(session, slot, false);
++    if(err != CHIAKI_ERR_SUCCESS) pad->status = pad->failure = -5; // reservation remains until acknowledged
++    return err;
++}
++
++ChiakiErrorCode chiaki_session_remove_user(ChiakiSession *session, uint8_t slot)
++{
++    if(slot < 1 || slot >= SLOT_COUNT) return CHIAKI_ERR_INVALID_DATA;
++    Sender *s = lock_session(session);
++    if(!s) return CHIAKI_ERR_UNINITIALIZED;
++    Slot *pad = &s->slots[slot];
++    ChiakiErrorCode err = CHIAKI_ERR_SUCCESS;
++    if(pad->reserved) {
++        if(s->pending_slot == slot) { pad->cancelled = true; pad->status = pad->failure = -8; }
++        else if(pad->status != 3) err = leave_locked(session, s, slot);
++    }
++    unlock_session(session, s);
++    return err;
++}
++
++int chiaki_multislot_status(ChiakiSession *session, uint8_t slot)
++{
++    if(slot < 1 || slot >= SLOT_COUNT) return -1;
++    Sender *s = lock_session(session);
++    if(!s) return 0;
++    int status = s->slots[slot].failure ? s->slots[slot].failure : s->slots[slot].status;
++    unlock_session(session, s);
++    return status;
++}
++
++void chiaki_multislot_ctrl_received(ChiakiSession *session, uint16_t type, const uint8_t *payload, size_t size)
++{
++    Sender *s = lock_session(session);
++    if(!s) return;
++    uint8_t slot = 0, result = 0;
++    if(type == 0x8068 || type == 0x8009) {
++        if(size < 2) goto done;
++        slot = payload[0]; result = payload[1];
++    } else if(type == 0x8008) {
++        if(!size) goto done;
++        slot = s->pending_slot; result = payload[0];
++    } else if(type == 0x61 || type == 0x64) {
++        slot = type == 0x61 && size ? payload[0] : s->pending_slot;
++        if(slot && slot < SLOT_COUNT && slot == s->pending_slot) {
++            s->slots[slot].cancelled = true;
++            s->slots[slot].status = s->slots[slot].failure = type == 0x61 ? -4 : -3;
++        }
++        goto done;
++    } else goto done;
++    if(slot < 1 || slot >= SLOT_COUNT) goto done;
++    Slot *pad = &s->slots[slot];
++    if(type == 0x8009) {
++        if(!pad->reserved || (pad->status != 3 && pad->status != -5)) goto done;
++        if(result == 0) {
++            pad->reserved = false; pad->status = 0; pad->rid = 0;
++            discard_slot_history(s, slot);
++        }
++        else pad->status = pad->failure = -7;
++        goto done;
++    }
++    if(s->pending_slot != slot || !pad->reserved) goto done;
++    CHIAKI_LOGI(session->log, "Co-op join reply: local_player=%u protocol_slot=%u result=%u", slot + 1, slot, result);
++    s->pending_slot = 0;
++    if(result == 0) {
++        if(pad->cancelled) leave_locked(session, s, slot);
++        else {
++            ChiakiErrorCode err = controller_connection(session, slot, true);
++            if(err == CHIAKI_ERR_SUCCESS) {
++                pad->active = pad->dirty = true; pad->status = 2;
++                chiaki_controller_state_set_idle(&pad->state);
++                chiaki_cond_signal(&s->cond);
++            } else { leave_locked(session, s, slot); pad->status = pad->failure = -5; }
++        }
++    } else {
++        pad->reserved = false;
++        if(!pad->cancelled) pad->status = pad->failure = (result == 2 || result == 5) ? -2 : result == 3 ? -3 : -1;
++    }
++done:
++    unlock_session(session, s);
++}
+diff --git a/lib/src/streamconnection.c b/lib/src/streamconnection.c
+index afa1a60..14cbbaa 100644
+--- a/lib/src/streamconnection.c
++++ b/lib/src/streamconnection.c
+@@ -26,6 +26,7 @@
+ 
+ #include "utils.h"
+ #include "pb_utils.h"
++#include "streamtransport.h"
+ 
+ 
+ #define STREAM_CONNECTION_PORT 9296
+@@ -139,7 +140,7 @@ CHIAKI_EXPORT void chiaki_stream_connection_fini(ChiakiStreamConnection *stream_
+ static bool state_finished_cond_check(void *user)
+ {
+ 	ChiakiStreamConnection *stream_connection = user;
+-	return stream_connection->state_finished || stream_connection->should_stop || stream_connection->remote_disconnected;
++	return stream_transport_wait_finished(stream_connection);
+ }
+ 
+ CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_run(ChiakiStreamConnection *stream_connection, chiaki_socket_t *socket)
+@@ -179,6 +180,13 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_run(ChiakiStreamConnectio
+ 		goto quit_label; \
+ 	} } while(0)
+ 
++#define CHECK_TRANSPORT(quit_label) do { \
++	if(stream_connection->state_failed) \
++	{ \
++		err = CHIAKI_ERR_NETWORK; \
++		goto quit_label; \
++	} } while(0)
++
+ 	stream_connection->audio_receiver = chiaki_audio_receiver_new(session, &stream_connection->packet_stats);
+ 	if(!stream_connection->audio_receiver)
+ 	{
+@@ -228,7 +236,8 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_run(ChiakiStreamConnectio
+ 
+ 	err = chiaki_cond_timedwait_pred(&stream_connection->state_cond, &stream_connection->state_mutex, EXPECT_TIMEOUT_MS, state_finished_cond_check, stream_connection);
+ 	assert(err == CHIAKI_ERR_SUCCESS || err == CHIAKI_ERR_TIMEOUT);
+-	CHECK_STOP(close_takion);
++	CHECK_STOP(err_congestion_control);
++	CHECK_TRANSPORT(err_congestion_control);
+ 	if(err != CHIAKI_ERR_SUCCESS)
+ 	{
+ 		CHIAKI_LOGE(session->log, "StreamConnection Takion connect failed");
+@@ -250,6 +259,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_run(ChiakiStreamConnectio
+ 	err = chiaki_cond_timedwait_pred(&stream_connection->state_cond, &stream_connection->state_mutex, EXPECT_TIMEOUT_MS, state_finished_cond_check, stream_connection);
+ 	assert(err == CHIAKI_ERR_SUCCESS || err == CHIAKI_ERR_TIMEOUT);
+ 	CHECK_STOP(disconnect);
++	CHECK_TRANSPORT(disconnect);
+ 
+ 	if(!stream_connection->state_finished)
+ 	{
+@@ -274,6 +284,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_run(ChiakiStreamConnectio
+ 		err = chiaki_cond_timedwait_pred(&stream_connection->state_cond, &stream_connection->state_mutex, EXPECT_TIMEOUT_MS, state_finished_cond_check, stream_connection);
+ 	assert(err == CHIAKI_ERR_SUCCESS || err == CHIAKI_ERR_TIMEOUT);
+ 	CHECK_STOP(disconnect);
++	CHECK_TRANSPORT(disconnect);
+ 
+ 	if(!stream_connection->state_finished)
+ 	{
+@@ -319,7 +330,11 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_run(ChiakiStreamConnectio
+ 
+ 		err = stream_connection_send_heartbeat(stream_connection);
+ 		if(err != CHIAKI_ERR_SUCCESS)
++		{
+ 			CHIAKI_LOGE(stream_connection->log, "StreamConnection failed to send heartbeat");
++			stream_connection->state_failed = true;
++			break;
++		}
+ 		else
+ 			CHIAKI_LOGV(stream_connection->log, "StreamConnection sent heartbeat");
+ 	}
+@@ -330,7 +345,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_run(ChiakiStreamConnectio
+ 	chiaki_feedback_sender_fini(&stream_connection->feedback_sender);
+ 	chiaki_mutex_unlock(&stream_connection->feedback_sender_mutex);
+ 
+-	err = CHIAKI_ERR_SUCCESS;
++	err = stream_connection->state_failed ? CHIAKI_ERR_NETWORK : CHIAKI_ERR_SUCCESS;
+ 
+ disconnect:
+ 	CHIAKI_LOGI(session->log, "StreamConnection is disconnecting");
+@@ -339,7 +354,8 @@ disconnect:
+ 		free(stream_connection->streaminfo_early_buf);
+ 		stream_connection->streaminfo_early_buf = NULL;
+ 	}
+-	stream_connection_send_disconnect(stream_connection);
++	if(!stream_connection->state_failed)
++		stream_connection_send_disconnect(stream_connection);
+ 
+ 	if(stream_connection->should_stop)
+ 	{
+@@ -381,6 +397,8 @@ err_audio_receiver:
+ 	if(!socket)
+ 		free(takion_info.sa);
+ 	return err;
++#undef CHECK_TRANSPORT
++#undef CHECK_STOP
+ }
+ 
+ CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_stop(ChiakiStreamConnection *stream_connection)
+@@ -402,7 +420,13 @@ static void stream_connection_takion_cb(ChiakiTakionEvent *event, void *user)
+ 		case CHIAKI_TAKION_EVENT_TYPE_CONNECTED:
+ 		case CHIAKI_TAKION_EVENT_TYPE_DISCONNECT:
+ 			chiaki_mutex_lock(&stream_connection->state_mutex);
+-			if(stream_connection->state == STATE_TAKION_CONNECT)
++			if(event->type == CHIAKI_TAKION_EVENT_TYPE_DISCONNECT)
++			{
++				if(!stream_connection->should_stop && !stream_connection->remote_disconnected)
++					CHIAKI_LOGW(stream_connection->log, "StreamConnection transport disconnected; stopping senders");
++				stream_transport_disconnected_locked(stream_connection);
++			}
++			else if(stream_connection->state == STATE_TAKION_CONNECT)
+ 			{
+ 				stream_connection->state_finished = event->type == CHIAKI_TAKION_EVENT_TYPE_CONNECTED;
+ 				stream_connection->state_failed = event->type == CHIAKI_TAKION_EVENT_TYPE_DISCONNECT;
+@@ -958,7 +982,7 @@ static void stream_connection_takion_data_expect_streaminfo(ChiakiStreamConnecti
+ 	// TODO: do some checks?
+ 
+ 	stream_connection_send_streaminfo_ack(stream_connection);
+-	
++
+ 	ChiakiErrorCode err = stream_connection_send_controller_connection(stream_connection);
+ 	if(err != CHIAKI_ERR_SUCCESS)
+ 	{
+diff --git a/lib/src/takion.c b/lib/src/takion.c
+index 9916009..1926445 100644
+--- a/lib/src/takion.c
++++ b/lib/src/takion.c
+@@ -1,4 +1,8 @@
+ // SPDX-License-Identifier: LicenseRef-AGPL-3.0-only-OpenSSL
++//
++// Local copy of external/chiaki-ng/lib/src/takion.c with perf overrides
++// (reusable recv buffer, borrowed-buffer ownership). Re-based on upstream at
++// each submodule bump — see docs/UPSTREAM_SYNC.md.
+ 
+ #include "chiaki/feedback.h"
+ #include <chiaki/takion.h>
+@@ -34,8 +38,6 @@
+ #include <netinet/ip.h>
+ #include <sys/socket.h>
+ #endif
+-
+-
+ // VERY similar to SCTP, see RFC 4960
+ 
+ #define TAKION_A_RWND 0x19000
+@@ -87,7 +89,6 @@ int takion_packet_type_mac_offset(TakionPacketType type)
+ 			return -1;
+ 	}
+ }
+-
+ /**
+  * @return The offset of the 4-byte key_pos inside a packet of type or -1 if unknown.
+  */
+@@ -195,6 +196,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_connect(ChiakiTakion *takion, Chiaki
+ 
+ 	takion->log = info->log;
+ 	takion->close_socket = info->close_socket;
++	takion->send_buffer.packets = NULL;
+ 	takion->version = info->protocol_version;
+ 	takion->disable_audio_video = info->disable_audio_video;
+ 
+@@ -442,6 +444,11 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_connect(ChiakiTakion *takion, Chiaki
+ 	}
+ 
+ 	err = chiaki_thread_create(&takion->thread, takion_thread_func, takion);
++	if(err != CHIAKI_ERR_SUCCESS)
++	{
++		ret = err;
++		goto error_sock;
++	}
+ 
+ 	chiaki_thread_set_name(&takion->thread, "Chiaki Takion");
+ 
+@@ -468,6 +475,19 @@ CHIAKI_EXPORT void chiaki_takion_close(ChiakiTakion *takion)
+ {
+ 	chiaki_stop_pipe_stop(&takion->stop_pipe);
+ 	chiaki_thread_join(&takion->thread, NULL);
++	// Keep the reliable sender alive until callers have stopped producing data.
++	if(takion->send_buffer.packets)
++	{
++		chiaki_takion_send_buffer_fini(&takion->send_buffer);
++		takion->send_buffer.packets = NULL;
++	}
++	// The stream owner stops feedback/congestion senders before calling close.
++	// Never close from the receive thread: those senders may still be using it.
++	if(takion->close_socket && !CHIAKI_SOCKET_IS_INVALID(takion->sock))
++	{
++		CHIAKI_SOCKET_CLOSE(takion->sock);
++		takion->sock = CHIAKI_INVALID_SOCKET;
++	}
+ 	chiaki_stop_pipe_fini(&takion->stop_pipe);
+ 	chiaki_mutex_fini(&takion->send_buffer_active_mutex);
+ 	chiaki_mutex_fini(&takion->seq_num_local_mutex);
+@@ -857,6 +877,49 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_send_feedback_history(ChiakiTakion *
+ 	return err;
+ }
+ 
++// per-slot variants for co-op: the feedback-state payload's first byte carries the
++// player slot (0xa0 | slot). History identifies slots in each event, never in byte 3.
++CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_send_feedback_state_slot(ChiakiTakion *takion, ChiakiSeqNum16 seq_num, ChiakiFeedbackState *feedback_state, uint8_t slot)
++{
++	uint8_t buf[0xc + CHIAKI_FEEDBACK_STATE_BUF_SIZE_MAX];
++	buf[0] = TAKION_PACKET_TYPE_FEEDBACK_STATE;
++	*((chiaki_unaligned_uint16_t *)(buf + 1)) = htons(seq_num);
++	buf[3] = 0;
++	*((chiaki_unaligned_uint32_t *)(buf + 4)) = 0;
++	*((chiaki_unaligned_uint32_t *)(buf + 8)) = 0;
++	size_t buf_sz;
++	if(takion->version <= 9)
++	{
++		buf_sz = 0xc + CHIAKI_FEEDBACK_STATE_BUF_SIZE_V9;
++		chiaki_feedback_state_format_v9(buf + 0xc, feedback_state);
++	}
++	else
++	{
++		buf_sz = 0xc + CHIAKI_FEEDBACK_STATE_BUF_SIZE_V12;
++		chiaki_feedback_state_format_v12(buf + 0xc, feedback_state);
++	}
++	buf[0xc] = 0xa0 | slot;
++	return takion_send_feedback_packet(takion, buf, buf_sz);
++}
++
++CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_send_feedback_history_slot(ChiakiTakion *takion, ChiakiSeqNum16 seq_num, uint8_t *payload, size_t payload_size, uint8_t slot)
++{
++	size_t buf_size = 0xc + payload_size;
++	uint8_t *buf = malloc(buf_size);
++	if(!buf)
++		return CHIAKI_ERR_MEMORY;
++	buf[0] = TAKION_PACKET_TYPE_FEEDBACK_HISTORY;
++	*((chiaki_unaligned_uint16_t *)(buf + 1)) = htons(seq_num);
++	(void)slot; // one sequence space; each history event contains its own slot tag
++	buf[3] = 0;
++	*((chiaki_unaligned_uint32_t *)(buf + 4)) = 0;
++	*((chiaki_unaligned_uint32_t *)(buf + 8)) = 0;
++	memcpy(buf + 0xc, payload, payload_size);
++	ChiakiErrorCode err = takion_send_feedback_packet(takion, buf, buf_size);
++	free(buf);
++	return err;
++}
++
+ static ChiakiErrorCode takion_handshake(ChiakiTakion *takion, uint32_t *seq_num_remote_initial)
+ {
+ 	ChiakiErrorCode err;
+@@ -1099,6 +1162,8 @@ static void *takion_thread_func(void *user)
+ 	ChiakiTakion *takion = user;
+ 	chiaki_thread_set_affinity(CHIAKI_THREAD_NAME_TAKION);
+ 
++	uint8_t recv_buf[1500];
++
+ 	takion->video_queue_initialized = false;
+ 	takion->video_queue_head_wait_start_us = 0;
+ 	takion->video_queue_head_wait_seq_num = 0;
+@@ -1163,6 +1228,7 @@ static void *takion_thread_func(void *user)
+ 			{
+ 				ChiakiTakionPostponedPacket *packet = &takion->postponed_packets[i];
+ 				takion_handle_packet(takion, packet->buf, packet->buf_size);
++				free(packet->buf);
+ 			}
+ 			free(takion->postponed_packets);
+ 			takion->postponed_packets = NULL;
+@@ -1170,21 +1236,18 @@ static void *takion_thread_func(void *user)
+ 			takion->postponed_packets_count = 0;
+ 		}
+ 
+-		size_t received_size = 1500;
+-		uint8_t *buf = malloc(received_size); // TODO: no malloc?
+-		if(!buf)
+-			break;
++		// buf is borrowed by takion_handle_packet(); callees that need to keep a packet
++		// copy it themselves, so this buffer can be reused for every datagram
++		size_t received_size = sizeof(recv_buf);
+ 		uint64_t recv_timeout_ms = takion_av_queues_next_timeout_ms(takion);
+ 		if(recv_timeout_ms == 0)
+ 		{
+-			free(buf);
+ 			takion_av_queues_flush_with_timeout(takion);
+ 			continue;
+ 		}
+-		ChiakiErrorCode err = takion_recv(takion, buf, &received_size, recv_timeout_ms);
++		ChiakiErrorCode err = takion_recv(takion, recv_buf, &received_size, recv_timeout_ms);
+ 		if(err != CHIAKI_ERR_SUCCESS)
+ 		{
+-			free(buf);
+ 			if(err == CHIAKI_ERR_TIMEOUT)
+ 			{
+ 				takion_av_queues_flush_with_timeout(takion);
+@@ -1192,13 +1255,7 @@ static void *takion_thread_func(void *user)
+ 			}
+ 			break;
+ 		}
+-		uint8_t *resized_buf = realloc(buf, received_size);
+-		if(!resized_buf)
+-		{
+-			free(buf);
+-			continue;
+-		}
+-		takion_handle_packet(takion, resized_buf, received_size);
++		takion_handle_packet(takion, recv_buf, received_size);
+ 	}
+ 
+ 	// Other threads (e.g. the heartbeat or an IDR request) may still send data, so stop them from using the send buffer first
+@@ -1223,14 +1280,6 @@ beach:
+ 		event.type = CHIAKI_TAKION_EVENT_TYPE_DISCONNECT;
+ 		takion->cb(&event, takion->cb_user);
+ 	}
+-	if(takion->close_socket)
+-	{
+-		if(!CHIAKI_SOCKET_IS_INVALID(takion->sock))
+-		{
+-			CHIAKI_SOCKET_CLOSE(takion->sock);
+-			takion->sock = CHIAKI_INVALID_SOCKET;
+-		}
+-	}
+ 	return NULL;
+ }
+ 
+@@ -1313,13 +1362,18 @@ static void takion_postpone_packet(ChiakiTakion *takion, uint8_t *buf, size_t bu
+ 	}
+ 
+ 	CHIAKI_LOGI(takion->log, "Postpone packet of size %#llx", (unsigned long long)buf_size);
++	// buf is borrowed from the recv loop buffer, so keep our own copy
++	uint8_t *buf_copy = malloc(buf_size);
++	if(!buf_copy)
++		return;
++	memcpy(buf_copy, buf, buf_size);
+ 	ChiakiTakionPostponedPacket *packet = &takion->postponed_packets[takion->postponed_packets_count++];
+-	packet->buf = buf;
++	packet->buf = buf_copy;
+ 	packet->buf_size = buf_size;
+ }
+ 
+ /**
+- * @param buf ownership of this buf is taken.
++ * @param buf is only borrowed; callees that need to keep the packet copy it.
+  */
+ static void takion_handle_packet(ChiakiTakion *takion, uint8_t *buf, size_t buf_size)
+ {
+@@ -1327,10 +1381,7 @@ static void takion_handle_packet(ChiakiTakion *takion, uint8_t *buf, size_t buf_
+ 	uint8_t base_type = (uint8_t)(buf[0] & TAKION_PACKET_BASE_TYPE_MASK);
+ 
+ 	if(takion_handle_packet_mac(takion, base_type, buf, buf_size) != CHIAKI_ERR_SUCCESS)
+-	{
+-		free(buf);
+ 		return;
+-	}
+ 
+ 	switch(base_type)
+ 	{
+@@ -1347,7 +1398,6 @@ static void takion_handle_packet(ChiakiTakion *takion, uint8_t *buf, size_t buf_
+ 		default:
+ 			CHIAKI_LOGW(takion->log, "Takion packet with unknown type %#x received", base_type);
+ 			chiaki_log_hexdump(takion->log, CHIAKI_LOG_WARNING, buf, buf_size);
+-			free(buf);
+ 			break;
+ 	}
+ }
+@@ -1358,10 +1408,7 @@ static void takion_handle_packet_message(ChiakiTakion *takion, uint8_t *buf, siz
+ 	TakionMessage msg;
+ 	ChiakiErrorCode err = takion_parse_message(takion, buf+1, buf_size-1, &msg);
+ 	if(err != CHIAKI_ERR_SUCCESS)
+-	{
+-		free(buf);
+ 		return;
+-	}
+ 
+ 	//CHIAKI_LOGD(takion->log, "Takion received message with tag %#x, key pos %#x, type (%#x, %#x), payload size %#x, payload:", msg.tag, msg.key_pos, msg.type_a, msg.type_b, msg.payload_size);
+ 	//chiaki_log_hexdump(takion->log, CHIAKI_LOG_DEBUG, buf, buf_size);
+@@ -1373,11 +1420,9 @@ static void takion_handle_packet_message(ChiakiTakion *takion, uint8_t *buf, siz
+ 			break;
+ 		case TAKION_CHUNK_TYPE_DATA_ACK:
+ 			takion_handle_packet_message_data_ack(takion, msg.chunk_flags, msg.payload, msg.payload_size);
+-			free(buf);
+ 			break;
+ 		default:
+ 			CHIAKI_LOGW(takion->log, "Takion received message with unknown chunk type = %#x", msg.chunk_type);
+-			free(buf);
+ 			break;
+ 	}
+ }
+@@ -1444,14 +1489,23 @@ static void takion_handle_packet_message_data(ChiakiTakion *takion, uint8_t *pac
+ 		return;
+ 	}
+ 
++	// packet_buf is borrowed from the recv loop buffer, so the queue entry needs its own copy
++	uint8_t *packet_copy = malloc(packet_buf_size);
++	if(!packet_copy)
++		return;
++	memcpy(packet_copy, packet_buf, packet_buf_size);
++
+ 	TakionDataPacketEntry *entry = malloc(sizeof(TakionDataPacketEntry));
+ 	if(!entry)
++	{
++		free(packet_copy);
+ 		return;
++	}
+ 
+ 	entry->type_b = type_b;
+-	entry->packet_buf = packet_buf;
++	entry->packet_buf = packet_copy;
+ 	entry->packet_size = packet_buf_size;
+-	entry->payload = payload;
++	entry->payload = packet_copy + (payload - packet_buf);
+ 	entry->payload_size = payload_size;
+ 	entry->channel = ntohs(*((chiaki_unaligned_uint16_t *)(payload + 4)));
+ 	ChiakiSeqNum32 seq_num = ntohl(*((chiaki_unaligned_uint32_t *)(payload + 0)));
+@@ -1674,27 +1728,20 @@ static ChiakiErrorCode takion_recv_message_cookie_ack(ChiakiTakion *takion)
+ static void takion_handle_packet_av(ChiakiTakion *takion, uint8_t base_type, uint8_t *buf, size_t buf_size)
+ {
+ 	// HHIxIIx
+-	// buf ownership is taken by this function (freed on error or transferred to queue entry).
++	// buf is only borrowed; the video queue entry gets its own copy if needed.
+ 	assert(base_type == TAKION_PACKET_TYPE_VIDEO || base_type == TAKION_PACKET_TYPE_AUDIO);
+ 	if((takion->disable_audio_video & CHIAKI_VIDEO_DISABLED) && (base_type == TAKION_PACKET_TYPE_VIDEO))
+-	{
+-		free(buf);
+ 		return;
+-	}
+ 	ChiakiTakionAVPacket packet;
+ 	ChiakiErrorCode err = takion->av_packet_parse(&packet, &takion->key_state, buf, buf_size);
+ 	if(err != CHIAKI_ERR_SUCCESS)
+ 	{
+ 		if(err == CHIAKI_ERR_BUF_TOO_SMALL)
+ 			CHIAKI_LOGE(takion->log, "Takion received AV packet that was too small");
+-		free(buf);
+ 		return;
+ 	}
+ 	if((takion->disable_audio_video & CHIAKI_AUDIO_DISABLED) && (base_type == TAKION_PACKET_TYPE_AUDIO) && !packet.is_haptics)
+-	{
+-		free(buf);
+ 		return;
+-	}
+ 
+ 	bool is_video = (base_type == TAKION_PACKET_TYPE_VIDEO);
+ 	if(!is_video)
+@@ -1706,7 +1753,6 @@ static void takion_handle_packet_av(ChiakiTakion *takion, uint8_t base_type, uin
+ 			event.av = &packet;
+ 			takion->cb(&event, takion->cb_user);
+ 		}
+-		free(buf);
+ 		return;
+ 	}
+ 	ChiakiReorderQueue *queue = &takion->video_queue;
+@@ -1730,7 +1776,6 @@ static void takion_handle_packet_av(ChiakiTakion *takion, uint8_t base_type, uin
+ 				event.av = &packet;
+ 				takion->cb(&event, takion->cb_user);
+ 			}
+-			free(buf);
+ 			return;
+ 		}
+ 		chiaki_reorder_queue_set_drop_strategy(queue, CHIAKI_REORDER_QUEUE_DROP_STRATEGY_BEGIN);
+@@ -1740,16 +1785,23 @@ static void takion_handle_packet_av(ChiakiTakion *takion, uint8_t base_type, uin
+ 		*head_wait_seq_num = queue_begin;
+ 	}
+ 
++	// buf is borrowed from the recv loop buffer, so the queue entry needs its own copy
++	uint8_t *buf_copy = malloc(buf_size);
++	if(!buf_copy)
++		return;
++	memcpy(buf_copy, buf, buf_size);
++
+ 	TakionAVPacketEntry *entry = malloc(sizeof(TakionAVPacketEntry));
+ 	if(!entry)
+ 	{
+-		free(buf);
++		free(buf_copy);
+ 		return;
+ 	}
+ 	entry->base_type = base_type;
+-	entry->buf = buf;
++	entry->buf = buf_copy;
+ 	entry->buf_size = buf_size;
+ 	entry->packet = packet;
++	entry->packet.data = buf_copy + (packet.data - buf);
+ 
+ 	chiaki_reorder_queue_push(queue, packet.packet_index, entry);
+ 	takion_av_queue_flush_with_timeout(takion, queue, head_wait, head_wait_seq_num);
+-- 
+2.56.0.windows.4
+
