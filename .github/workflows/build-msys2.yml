@@ -1,6 +1,9 @@
 name: Build chiaki-ng msys2 x86 Windows
 
 on:
+  push:
+    branches:
+      - feature/ps5-local-coop-core
   workflow_dispatch:
     inputs:
       libplacebo_version:
@@ -24,7 +27,7 @@ jobs:
         run: |
           git config --global core.autocrlf false
           git config --global core.eol lf
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
         with:
           submodules: recursive
       - uses: msys2/setup-msys2@v2
@@ -113,7 +116,7 @@ jobs:
           echo "RELEASE_PACKAGE_PATH=${RELEASE_PACKAGE_FILE}" >> $GITHUB_ENV
 
       - name: Upload chiaki-ng Artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: chiaki-ng-win_x64-MSYS2-Release-portable.zip
           path: ${{ env.RELEASE_PACKAGE_PATH }}
@@ -121,16 +124,17 @@ jobs:
           retention-days: 7
 
       - name: Compile .ISS to .EXE Installer
-        uses: Minionguyjpro/Inno-Setup-Action@v1.2.9
+        uses: Minionguyjpro/Inno-Setup-Action@v1.2.7
         with:
           path: "scripts/chiaki-ng.iss"
           options: /O+
 
       - name: Upload chiaki-ng Artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: chiaki-ng-win_x64-MSYS2-Release-installer.exe
           path: chiaki-ng-windows-installer.exe
           if-no-files-found: error
           retention-days: 7
           
+
