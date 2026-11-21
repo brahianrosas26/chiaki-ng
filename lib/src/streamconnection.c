@@ -26,6 +26,7 @@
 
 #include "utils.h"
 #include "pb_utils.h"
+#include "streamtransport.h"
 
 
 #define STREAM_CONNECTION_PORT 9296
@@ -139,7 +140,7 @@ CHIAKI_EXPORT void chiaki_stream_connection_fini(ChiakiStreamConnection *stream_
 static bool state_finished_cond_check(void *user)
 {
 	ChiakiStreamConnection *stream_connection = user;
-	return stream_connection->state_finished || stream_connection->should_stop || stream_connection->remote_disconnected;
+	return stream_transport_wait_finished(stream_connection);
 }
 
 CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_run(ChiakiStreamConnection *stream_connection, chiaki_socket_t *socket)
@@ -176,6 +177,13 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_run(ChiakiStreamConnectio
 #define CHECK_STOP(quit_label) do { \
 	if(stream_connection->should_stop) \
 	{ \
+		goto quit_label; \
+	} } while(0)
+
+#define CHECK_TRANSPORT(quit_label) do { \
+	if(stream_connection->state_failed) \
+	{ \
+		err = CHIAKI_ERR_NETWORK; \
 		goto quit_label; \
 	} } while(0)
 
@@ -228,7 +236,8 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_run(ChiakiStreamConnectio
 
 	err = chiaki_cond_timedwait_pred(&stream_connection->state_cond, &stream_connection->state_mutex, EXPECT_TIMEOUT_MS, state_finished_cond_check, stream_connection);
 	assert(err == CHIAKI_ERR_SUCCESS || err == CHIAKI_ERR_TIMEOUT);
-	CHECK_STOP(close_takion);
+	CHECK_STOP(err_congestion_control);
+	CHECK_TRANSPORT(err_congestion_control);
 	if(err != CHIAKI_ERR_SUCCESS)
 	{
 		CHIAKI_LOGE(session->log, "StreamConnection Takion connect failed");
@@ -250,6 +259,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_run(ChiakiStreamConnectio
 	err = chiaki_cond_timedwait_pred(&stream_connection->state_cond, &stream_connection->state_mutex, EXPECT_TIMEOUT_MS, state_finished_cond_check, stream_connection);
 	assert(err == CHIAKI_ERR_SUCCESS || err == CHIAKI_ERR_TIMEOUT);
 	CHECK_STOP(disconnect);
+	CHECK_TRANSPORT(disconnect);
 
 	if(!stream_connection->state_finished)
 	{
@@ -274,6 +284,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_run(ChiakiStreamConnectio
 		err = chiaki_cond_timedwait_pred(&stream_connection->state_cond, &stream_connection->state_mutex, EXPECT_TIMEOUT_MS, state_finished_cond_check, stream_connection);
 	assert(err == CHIAKI_ERR_SUCCESS || err == CHIAKI_ERR_TIMEOUT);
 	CHECK_STOP(disconnect);
+	CHECK_TRANSPORT(disconnect);
 
 	if(!stream_connection->state_finished)
 	{
@@ -319,7 +330,11 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_run(ChiakiStreamConnectio
 
 		err = stream_connection_send_heartbeat(stream_connection);
 		if(err != CHIAKI_ERR_SUCCESS)
+		{
 			CHIAKI_LOGE(stream_connection->log, "StreamConnection failed to send heartbeat");
+			stream_connection->state_failed = true;
+			break;
+		}
 		else
 			CHIAKI_LOGV(stream_connection->log, "StreamConnection sent heartbeat");
 	}
@@ -330,7 +345,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_run(ChiakiStreamConnectio
 	chiaki_feedback_sender_fini(&stream_connection->feedback_sender);
 	chiaki_mutex_unlock(&stream_connection->feedback_sender_mutex);
 
-	err = CHIAKI_ERR_SUCCESS;
+	err = stream_connection->state_failed ? CHIAKI_ERR_NETWORK : CHIAKI_ERR_SUCCESS;
 
 disconnect:
 	CHIAKI_LOGI(session->log, "StreamConnection is disconnecting");
@@ -339,7 +354,8 @@ disconnect:
 		free(stream_connection->streaminfo_early_buf);
 		stream_connection->streaminfo_early_buf = NULL;
 	}
-	stream_connection_send_disconnect(stream_connection);
+	if(!stream_connection->state_failed)
+		stream_connection_send_disconnect(stream_connection);
 
 	if(stream_connection->should_stop)
 	{
@@ -381,6 +397,8 @@ err_audio_receiver:
 	if(!socket)
 		free(takion_info.sa);
 	return err;
+#undef CHECK_TRANSPORT
+#undef CHECK_STOP
 }
 
 CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_stop(ChiakiStreamConnection *stream_connection)
@@ -402,7 +420,13 @@ static void stream_connection_takion_cb(ChiakiTakionEvent *event, void *user)
 		case CHIAKI_TAKION_EVENT_TYPE_CONNECTED:
 		case CHIAKI_TAKION_EVENT_TYPE_DISCONNECT:
 			chiaki_mutex_lock(&stream_connection->state_mutex);
-			if(stream_connection->state == STATE_TAKION_CONNECT)
+			if(event->type == CHIAKI_TAKION_EVENT_TYPE_DISCONNECT)
+			{
+				if(!stream_connection->should_stop && !stream_connection->remote_disconnected)
+					CHIAKI_LOGW(stream_connection->log, "StreamConnection transport disconnected; stopping senders");
+				stream_transport_disconnected_locked(stream_connection);
+			}
+			else if(stream_connection->state == STATE_TAKION_CONNECT)
 			{
 				stream_connection->state_finished = event->type == CHIAKI_TAKION_EVENT_TYPE_CONNECTED;
 				stream_connection->state_failed = event->type == CHIAKI_TAKION_EVENT_TYPE_DISCONNECT;
@@ -958,7 +982,7 @@ static void stream_connection_takion_data_expect_streaminfo(ChiakiStreamConnecti
 	// TODO: do some checks?
 
 	stream_connection_send_streaminfo_ack(stream_connection);
-	
+
 	ChiakiErrorCode err = stream_connection_send_controller_connection(stream_connection);
 	if(err != CHIAKI_ERR_SUCCESS)
 	{
@@ -1300,3 +1324,4 @@ CHIAKI_EXPORT ChiakiErrorCode stream_connection_send_idr_request(ChiakiStreamCon
 	CHIAKI_LOGI(stream_connection->log, "StreamConnection requesting IDR frame");
 	return chiaki_takion_send_message_data(&stream_connection->takion, 1, 2, buf, stream.bytes_written, NULL);
 }
+

@@ -1,4 +1,8 @@
 // SPDX-License-Identifier: LicenseRef-AGPL-3.0-only-OpenSSL
+//
+// Local copy of external/chiaki-ng/lib/src/takion.c with perf overrides
+// (reusable recv buffer, borrowed-buffer ownership). Re-based on upstream at
+// each submodule bump — see docs/UPSTREAM_SYNC.md.
 
 #include "chiaki/feedback.h"
 #include <chiaki/takion.h>
@@ -34,8 +38,6 @@
 #include <netinet/ip.h>
 #include <sys/socket.h>
 #endif
-
-
 // VERY similar to SCTP, see RFC 4960
 
 #define TAKION_A_RWND 0x19000
@@ -87,7 +89,6 @@ int takion_packet_type_mac_offset(TakionPacketType type)
 			return -1;
 	}
 }
-
 /**
  * @return The offset of the 4-byte key_pos inside a packet of type or -1 if unknown.
  */
@@ -195,6 +196,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_connect(ChiakiTakion *takion, Chiaki
 
 	takion->log = info->log;
 	takion->close_socket = info->close_socket;
+	takion->send_buffer.packets = NULL;
 	takion->version = info->protocol_version;
 	takion->disable_audio_video = info->disable_audio_video;
 
@@ -442,6 +444,11 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_connect(ChiakiTakion *takion, Chiaki
 	}
 
 	err = chiaki_thread_create(&takion->thread, takion_thread_func, takion);
+	if(err != CHIAKI_ERR_SUCCESS)
+	{
+		ret = err;
+		goto error_sock;
+	}
 
 	chiaki_thread_set_name(&takion->thread, "Chiaki Takion");
 
@@ -468,6 +475,19 @@ CHIAKI_EXPORT void chiaki_takion_close(ChiakiTakion *takion)
 {
 	chiaki_stop_pipe_stop(&takion->stop_pipe);
 	chiaki_thread_join(&takion->thread, NULL);
+	// Keep the reliable sender alive until callers have stopped producing data.
+	if(takion->send_buffer.packets)
+	{
+		chiaki_takion_send_buffer_fini(&takion->send_buffer);
+		takion->send_buffer.packets = NULL;
+	}
+	// The stream owner stops feedback/congestion senders before calling close.
+	// Never close from the receive thread: those senders may still be using it.
+	if(takion->close_socket && !CHIAKI_SOCKET_IS_INVALID(takion->sock))
+	{
+		CHIAKI_SOCKET_CLOSE(takion->sock);
+		takion->sock = CHIAKI_INVALID_SOCKET;
+	}
 	chiaki_stop_pipe_fini(&takion->stop_pipe);
 	chiaki_mutex_fini(&takion->send_buffer_active_mutex);
 	chiaki_mutex_fini(&takion->seq_num_local_mutex);
@@ -857,6 +877,49 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_send_feedback_history(ChiakiTakion *
 	return err;
 }
 
+// per-slot variants for co-op: the feedback-state payload's first byte carries the
+// player slot (0xa0 | slot). History identifies slots in each event, never in byte 3.
+CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_send_feedback_state_slot(ChiakiTakion *takion, ChiakiSeqNum16 seq_num, ChiakiFeedbackState *feedback_state, uint8_t slot)
+{
+	uint8_t buf[0xc + CHIAKI_FEEDBACK_STATE_BUF_SIZE_MAX];
+	buf[0] = TAKION_PACKET_TYPE_FEEDBACK_STATE;
+	*((chiaki_unaligned_uint16_t *)(buf + 1)) = htons(seq_num);
+	buf[3] = 0;
+	*((chiaki_unaligned_uint32_t *)(buf + 4)) = 0;
+	*((chiaki_unaligned_uint32_t *)(buf + 8)) = 0;
+	size_t buf_sz;
+	if(takion->version <= 9)
+	{
+		buf_sz = 0xc + CHIAKI_FEEDBACK_STATE_BUF_SIZE_V9;
+		chiaki_feedback_state_format_v9(buf + 0xc, feedback_state);
+	}
+	else
+	{
+		buf_sz = 0xc + CHIAKI_FEEDBACK_STATE_BUF_SIZE_V12;
+		chiaki_feedback_state_format_v12(buf + 0xc, feedback_state);
+	}
+	buf[0xc] = 0xa0 | slot;
+	return takion_send_feedback_packet(takion, buf, buf_sz);
+}
+
+CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_send_feedback_history_slot(ChiakiTakion *takion, ChiakiSeqNum16 seq_num, uint8_t *payload, size_t payload_size, uint8_t slot)
+{
+	size_t buf_size = 0xc + payload_size;
+	uint8_t *buf = malloc(buf_size);
+	if(!buf)
+		return CHIAKI_ERR_MEMORY;
+	buf[0] = TAKION_PACKET_TYPE_FEEDBACK_HISTORY;
+	*((chiaki_unaligned_uint16_t *)(buf + 1)) = htons(seq_num);
+	(void)slot; // one sequence space; each history event contains its own slot tag
+	buf[3] = 0;
+	*((chiaki_unaligned_uint32_t *)(buf + 4)) = 0;
+	*((chiaki_unaligned_uint32_t *)(buf + 8)) = 0;
+	memcpy(buf + 0xc, payload, payload_size);
+	ChiakiErrorCode err = takion_send_feedback_packet(takion, buf, buf_size);
+	free(buf);
+	return err;
+}
+
 static ChiakiErrorCode takion_handshake(ChiakiTakion *takion, uint32_t *seq_num_remote_initial)
 {
 	ChiakiErrorCode err;
@@ -1099,6 +1162,8 @@ static void *takion_thread_func(void *user)
 	ChiakiTakion *takion = user;
 	chiaki_thread_set_affinity(CHIAKI_THREAD_NAME_TAKION);
 
+	uint8_t recv_buf[1500];
+
 	takion->video_queue_initialized = false;
 	takion->video_queue_head_wait_start_us = 0;
 	takion->video_queue_head_wait_seq_num = 0;
@@ -1163,6 +1228,7 @@ static void *takion_thread_func(void *user)
 			{
 				ChiakiTakionPostponedPacket *packet = &takion->postponed_packets[i];
 				takion_handle_packet(takion, packet->buf, packet->buf_size);
+				free(packet->buf);
 			}
 			free(takion->postponed_packets);
 			takion->postponed_packets = NULL;
@@ -1170,21 +1236,18 @@ static void *takion_thread_func(void *user)
 			takion->postponed_packets_count = 0;
 		}
 
-		size_t received_size = 1500;
-		uint8_t *buf = malloc(received_size); // TODO: no malloc?
-		if(!buf)
-			break;
+		// buf is borrowed by takion_handle_packet(); callees that need to keep a packet
+		// copy it themselves, so this buffer can be reused for every datagram
+		size_t received_size = sizeof(recv_buf);
 		uint64_t recv_timeout_ms = takion_av_queues_next_timeout_ms(takion);
 		if(recv_timeout_ms == 0)
 		{
-			free(buf);
 			takion_av_queues_flush_with_timeout(takion);
 			continue;
 		}
-		ChiakiErrorCode err = takion_recv(takion, buf, &received_size, recv_timeout_ms);
+		ChiakiErrorCode err = takion_recv(takion, recv_buf, &received_size, recv_timeout_ms);
 		if(err != CHIAKI_ERR_SUCCESS)
 		{
-			free(buf);
 			if(err == CHIAKI_ERR_TIMEOUT)
 			{
 				takion_av_queues_flush_with_timeout(takion);
@@ -1192,13 +1255,7 @@ static void *takion_thread_func(void *user)
 			}
 			break;
 		}
-		uint8_t *resized_buf = realloc(buf, received_size);
-		if(!resized_buf)
-		{
-			free(buf);
-			continue;
-		}
-		takion_handle_packet(takion, resized_buf, received_size);
+		takion_handle_packet(takion, recv_buf, received_size);
 	}
 
 	// Other threads (e.g. the heartbeat or an IDR request) may still send data, so stop them from using the send buffer first
@@ -1222,14 +1279,6 @@ beach:
 		ChiakiTakionEvent event = { 0 };
 		event.type = CHIAKI_TAKION_EVENT_TYPE_DISCONNECT;
 		takion->cb(&event, takion->cb_user);
-	}
-	if(takion->close_socket)
-	{
-		if(!CHIAKI_SOCKET_IS_INVALID(takion->sock))
-		{
-			CHIAKI_SOCKET_CLOSE(takion->sock);
-			takion->sock = CHIAKI_INVALID_SOCKET;
-		}
 	}
 	return NULL;
 }
@@ -1313,13 +1362,18 @@ static void takion_postpone_packet(ChiakiTakion *takion, uint8_t *buf, size_t bu
 	}
 
 	CHIAKI_LOGI(takion->log, "Postpone packet of size %#llx", (unsigned long long)buf_size);
+	// buf is borrowed from the recv loop buffer, so keep our own copy
+	uint8_t *buf_copy = malloc(buf_size);
+	if(!buf_copy)
+		return;
+	memcpy(buf_copy, buf, buf_size);
 	ChiakiTakionPostponedPacket *packet = &takion->postponed_packets[takion->postponed_packets_count++];
-	packet->buf = buf;
+	packet->buf = buf_copy;
 	packet->buf_size = buf_size;
 }
 
 /**
- * @param buf ownership of this buf is taken.
+ * @param buf is only borrowed; callees that need to keep the packet copy it.
  */
 static void takion_handle_packet(ChiakiTakion *takion, uint8_t *buf, size_t buf_size)
 {
@@ -1327,10 +1381,7 @@ static void takion_handle_packet(ChiakiTakion *takion, uint8_t *buf, size_t buf_
 	uint8_t base_type = (uint8_t)(buf[0] & TAKION_PACKET_BASE_TYPE_MASK);
 
 	if(takion_handle_packet_mac(takion, base_type, buf, buf_size) != CHIAKI_ERR_SUCCESS)
-	{
-		free(buf);
 		return;
-	}
 
 	switch(base_type)
 	{
@@ -1347,7 +1398,6 @@ static void takion_handle_packet(ChiakiTakion *takion, uint8_t *buf, size_t buf_
 		default:
 			CHIAKI_LOGW(takion->log, "Takion packet with unknown type %#x received", base_type);
 			chiaki_log_hexdump(takion->log, CHIAKI_LOG_WARNING, buf, buf_size);
-			free(buf);
 			break;
 	}
 }
@@ -1358,10 +1408,7 @@ static void takion_handle_packet_message(ChiakiTakion *takion, uint8_t *buf, siz
 	TakionMessage msg;
 	ChiakiErrorCode err = takion_parse_message(takion, buf+1, buf_size-1, &msg);
 	if(err != CHIAKI_ERR_SUCCESS)
-	{
-		free(buf);
 		return;
-	}
 
 	//CHIAKI_LOGD(takion->log, "Takion received message with tag %#x, key pos %#x, type (%#x, %#x), payload size %#x, payload:", msg.tag, msg.key_pos, msg.type_a, msg.type_b, msg.payload_size);
 	//chiaki_log_hexdump(takion->log, CHIAKI_LOG_DEBUG, buf, buf_size);
@@ -1373,11 +1420,9 @@ static void takion_handle_packet_message(ChiakiTakion *takion, uint8_t *buf, siz
 			break;
 		case TAKION_CHUNK_TYPE_DATA_ACK:
 			takion_handle_packet_message_data_ack(takion, msg.chunk_flags, msg.payload, msg.payload_size);
-			free(buf);
 			break;
 		default:
 			CHIAKI_LOGW(takion->log, "Takion received message with unknown chunk type = %#x", msg.chunk_type);
-			free(buf);
 			break;
 	}
 }
@@ -1444,14 +1489,23 @@ static void takion_handle_packet_message_data(ChiakiTakion *takion, uint8_t *pac
 		return;
 	}
 
+	// packet_buf is borrowed from the recv loop buffer, so the queue entry needs its own copy
+	uint8_t *packet_copy = malloc(packet_buf_size);
+	if(!packet_copy)
+		return;
+	memcpy(packet_copy, packet_buf, packet_buf_size);
+
 	TakionDataPacketEntry *entry = malloc(sizeof(TakionDataPacketEntry));
 	if(!entry)
+	{
+		free(packet_copy);
 		return;
+	}
 
 	entry->type_b = type_b;
-	entry->packet_buf = packet_buf;
+	entry->packet_buf = packet_copy;
 	entry->packet_size = packet_buf_size;
-	entry->payload = payload;
+	entry->payload = packet_copy + (payload - packet_buf);
 	entry->payload_size = payload_size;
 	entry->channel = ntohs(*((chiaki_unaligned_uint16_t *)(payload + 4)));
 	ChiakiSeqNum32 seq_num = ntohl(*((chiaki_unaligned_uint32_t *)(payload + 0)));
@@ -1674,27 +1728,20 @@ static ChiakiErrorCode takion_recv_message_cookie_ack(ChiakiTakion *takion)
 static void takion_handle_packet_av(ChiakiTakion *takion, uint8_t base_type, uint8_t *buf, size_t buf_size)
 {
 	// HHIxIIx
-	// buf ownership is taken by this function (freed on error or transferred to queue entry).
+	// buf is only borrowed; the video queue entry gets its own copy if needed.
 	assert(base_type == TAKION_PACKET_TYPE_VIDEO || base_type == TAKION_PACKET_TYPE_AUDIO);
 	if((takion->disable_audio_video & CHIAKI_VIDEO_DISABLED) && (base_type == TAKION_PACKET_TYPE_VIDEO))
-	{
-		free(buf);
 		return;
-	}
 	ChiakiTakionAVPacket packet;
 	ChiakiErrorCode err = takion->av_packet_parse(&packet, &takion->key_state, buf, buf_size);
 	if(err != CHIAKI_ERR_SUCCESS)
 	{
 		if(err == CHIAKI_ERR_BUF_TOO_SMALL)
 			CHIAKI_LOGE(takion->log, "Takion received AV packet that was too small");
-		free(buf);
 		return;
 	}
 	if((takion->disable_audio_video & CHIAKI_AUDIO_DISABLED) && (base_type == TAKION_PACKET_TYPE_AUDIO) && !packet.is_haptics)
-	{
-		free(buf);
 		return;
-	}
 
 	bool is_video = (base_type == TAKION_PACKET_TYPE_VIDEO);
 	if(!is_video)
@@ -1706,7 +1753,6 @@ static void takion_handle_packet_av(ChiakiTakion *takion, uint8_t base_type, uin
 			event.av = &packet;
 			takion->cb(&event, takion->cb_user);
 		}
-		free(buf);
 		return;
 	}
 	ChiakiReorderQueue *queue = &takion->video_queue;
@@ -1730,7 +1776,6 @@ static void takion_handle_packet_av(ChiakiTakion *takion, uint8_t base_type, uin
 				event.av = &packet;
 				takion->cb(&event, takion->cb_user);
 			}
-			free(buf);
 			return;
 		}
 		chiaki_reorder_queue_set_drop_strategy(queue, CHIAKI_REORDER_QUEUE_DROP_STRATEGY_BEGIN);
@@ -1740,16 +1785,23 @@ static void takion_handle_packet_av(ChiakiTakion *takion, uint8_t base_type, uin
 		*head_wait_seq_num = queue_begin;
 	}
 
+	// buf is borrowed from the recv loop buffer, so the queue entry needs its own copy
+	uint8_t *buf_copy = malloc(buf_size);
+	if(!buf_copy)
+		return;
+	memcpy(buf_copy, buf, buf_size);
+
 	TakionAVPacketEntry *entry = malloc(sizeof(TakionAVPacketEntry));
 	if(!entry)
 	{
-		free(buf);
+		free(buf_copy);
 		return;
 	}
 	entry->base_type = base_type;
-	entry->buf = buf;
+	entry->buf = buf_copy;
 	entry->buf_size = buf_size;
 	entry->packet = packet;
+	entry->packet.data = buf_copy + (packet.data - buf);
 
 	chiaki_reorder_queue_push(queue, packet.packet_index, entry);
 	takion_av_queue_flush_with_timeout(takion, queue, head_wait, head_wait_seq_num);
@@ -1982,3 +2034,4 @@ static ChiakiErrorCode takion_read_extra_sock_messages(ChiakiTakion *takion)
             return CHIAKI_ERR_NETWORK;
 	}
 }
+

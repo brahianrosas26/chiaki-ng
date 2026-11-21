@@ -5,6 +5,7 @@
 #include <chiaki/base64.h>
 #include <chiaki/http.h>
 #include <chiaki/time.h>
+#include <chiaki/multislot.h>
 
 #include "utils.h"
 
@@ -854,9 +855,21 @@ static void ctrl_message_received(ChiakiCtrl *ctrl, uint16_t msg_type, uint8_t *
 		}
 	}
 
-	CHIAKI_LOGV(ctrl->session->log, "Ctrl received message of type %#x, size %#llx", (unsigned int)msg_type, (unsigned long long)payload_size);
+	CHIAKI_LOGI(ctrl->session->log, "Ctrl received message of type %#x, size %#llx", (unsigned int)msg_type, (unsigned long long)payload_size);
 	if(payload_size > 0)
-		chiaki_log_hexdump(ctrl->session->log, CHIAKI_LOG_VERBOSE, payload, payload_size);
+		chiaki_log_hexdump(ctrl->session->log, CHIAKI_LOG_INFO, payload, payload_size);
+
+	if(msg_type == 0x8068 || msg_type == 0x8008 || msg_type == 0x8009 ||
+		msg_type == 0x61 || msg_type == 0x64)
+	{
+		// The receive loop owns notif_mutex. Co-op may enqueue a CONTROLLER_DEL,
+		// which takes that mutex again; also never invert it with feedback_sender_mutex.
+		// Only this thread touches recv_buf, so the decrypted payload remains stable.
+		chiaki_mutex_unlock(&ctrl->notif_mutex);
+		chiaki_multislot_ctrl_received(ctrl->session, msg_type, payload, payload_size);
+		chiaki_mutex_lock(&ctrl->notif_mutex);
+		return;
+	}
 
 	switch(msg_type)
 	{
@@ -892,7 +905,7 @@ static void ctrl_message_received(ChiakiCtrl *ctrl, uint16_t msg_type, uint8_t *
 			ctrl_message_received_switch_to_stream_connection(ctrl, payload, payload_size);
 			break;
 		default:
-			// CHIAKI_LOGW(ctrl->session->log, "Received Ctrl Message with unknown type %#x", msg_type);
+			CHIAKI_LOGI(ctrl->session->log, "Received Ctrl Message with unknown type %#x", msg_type);
 			chiaki_log_hexdump(ctrl->session->log, CHIAKI_LOG_WARNING, payload, payload_size);
 			break;
 	}
@@ -1539,3 +1552,4 @@ error:
 	}
 	return err;
 }
+

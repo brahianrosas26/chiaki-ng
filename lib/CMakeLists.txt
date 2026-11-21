@@ -76,6 +76,7 @@ set(SOURCE_FILES
 		src/discoveryservice.c
 		src/feedback.c
 		src/feedbacksender.c
+		src/multislot.c
 		src/controller.c
 		src/takionsendbuffer.c
 		src/time.c
@@ -225,3 +226,4 @@ if(CHIAKI_ENABLE_TESTS)
 	add_executable(holepunch-test include/chiaki/remote/holepunch.h src/remote/holepunch-test.c)
 	target_link_libraries(holepunch-test chiaki-lib)
 endif()
+
