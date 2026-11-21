@@ -26,7 +26,6 @@
 
 #include "utils.h"
 #include "pb_utils.h"
-#include "streamtransport.h"
 
 
 #define STREAM_CONNECTION_PORT 9296
@@ -135,6 +134,20 @@ CHIAKI_EXPORT void chiaki_stream_connection_fini(ChiakiStreamConnection *stream_
 
 	chiaki_cond_fini(&stream_connection->state_cond);
 	chiaki_mutex_fini(&stream_connection->state_mutex);
+}
+
+/* Android keeps these helpers in streamtransport.  The desktop transport is
+ * owned directly by StreamConnection, so keep the same state transition here. */
+static bool stream_transport_wait_finished(ChiakiStreamConnection *stream_connection)
+{
+	return stream_connection->state_finished || stream_connection->should_stop || stream_connection->remote_disconnected;
+}
+
+static void stream_transport_disconnected_locked(ChiakiStreamConnection *stream_connection)
+{
+	stream_connection->state_failed = true;
+	stream_connection->state_finished = true;
+	chiaki_cond_broadcast(&stream_connection->state_cond);
 }
 
 static bool state_finished_cond_check(void *user)
